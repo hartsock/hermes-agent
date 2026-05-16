@@ -271,31 +271,45 @@ class TestArgparseWiring:
         ns = p.parse_args(["ps"])
         assert ns.dgx_command == "ps"
 
-    # --- Tier 2: planned subcommands (red) ---
+    # --- Tier 2: implemented ---
 
-    @pytest.mark.xfail(reason="T2: hermes dgx run not yet implemented", strict=True)
     def test_run_subcommand_parses_cmd_arg(self):
         p = self._parser()
         ns = p.parse_args(["run", "nvidia-smi"])
         assert ns.dgx_command == "run"
+        assert "nvidia-smi" in ns.cmd
 
-    @pytest.mark.xfail(reason="T2: hermes dgx push not yet implemented", strict=True)
-    def test_push_subcommand_parses_path_arg(self):
+    def test_run_subcommand_passes_through_flags(self):
+        p = self._parser()
+        ns = p.parse_args(["run", "nvidia-smi", "--query-gpu=name", "--format=csv"])
+        assert "--query-gpu=name" in ns.cmd
+
+    def test_push_subcommand_parses_local_path(self):
         p = self._parser()
         ns = p.parse_args(["push", "./myproject"])
         assert ns.dgx_command == "push"
+        assert ns.local == "./myproject"
+        assert ns.remote is None
 
-    @pytest.mark.xfail(reason="T2: hermes dgx doctor not yet implemented", strict=True)
+    def test_push_subcommand_parses_remote_path(self):
+        p = self._parser()
+        ns = p.parse_args(["push", "./myproject", "~/code/"])
+        assert ns.remote == "~/code/"
+
     def test_doctor_subcommand_parses(self):
         p = self._parser()
         ns = p.parse_args(["doctor"])
         assert ns.dgx_command == "doctor"
 
-    @pytest.mark.xfail(reason="T2: hermes dgx watch not yet implemented", strict=True)
     def test_watch_subcommand_parses(self):
         p = self._parser()
         ns = p.parse_args(["watch"])
         assert ns.dgx_command == "watch"
+
+    def test_watch_interval_flag(self):
+        p = self._parser()
+        ns = p.parse_args(["watch", "--interval", "5"])
+        assert ns.interval == 5
 
 
 # ---------------------------------------------------------------------------
@@ -489,38 +503,77 @@ class TestTier1Ps:
 # ---------------------------------------------------------------------------
 
 class TestTier2Run:
-    @pytest.mark.xfail(reason="T2: run not implemented", strict=True)
-    def test_run_executes_command_via_ssh(self, mock_config, monkeypatch, capsys):
+    def test_run_executes_command_via_ssh(self, mock_config, monkeypatch):
         from plugins.dgx.cli import _cmd_run
-        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda u, h, cmd, **k: (True, "hello from dgx"))
+        calls = []
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda u, h, cmd, **k: calls.append(cmd) or 0)
         ret = _cmd_run("echo hello")
-        assert "hello from dgx" in capsys.readouterr().out
+        assert any("echo hello" in c for c in calls)
         assert ret == 0
 
-    @pytest.mark.xfail(reason="T2: run not implemented", strict=True)
     def test_run_returns_nonzero_on_failure(self, mock_config, monkeypatch):
         from plugins.dgx.cli import _cmd_run
-        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (False, "error"))
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda *a, **k: 1)
         assert _cmd_run("bad-cmd") != 0
+
+    def test_run_passes_full_command_including_flags(self, mock_config, monkeypatch):
+        from plugins.dgx.cli import _cmd_run
+        calls = []
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda u, h, cmd, **k: calls.append(cmd) or 0)
+        _cmd_run("nvidia-smi --query-gpu=name --format=csv")
+        assert any("--query-gpu=name" in c for c in calls)
 
 
 class TestTier2Push:
-    @pytest.mark.xfail(reason="T2: push not implemented", strict=True)
     def test_push_calls_rsync(self, mock_config, monkeypatch, tmp_path):
         from plugins.dgx.cli import _cmd_push
         calls = []
-        monkeypatch.setattr("subprocess.run", lambda cmd, **k: calls.append(cmd) or MagicMock(returncode=0))
+        monkeypatch.setattr("subprocess.run",
+                            lambda cmd, **k: calls.append(cmd) or MagicMock(returncode=0))
         (tmp_path / "file.py").write_text("x = 1")
         ret = _cmd_push(str(tmp_path / "file.py"), None)
         assert any("rsync" in str(c) for c in calls)
         assert ret == 0
 
+    def test_push_uses_default_remote_path(self, mock_config, monkeypatch, tmp_path):
+        from plugins.dgx.cli import _cmd_push
+        calls = []
+        monkeypatch.setattr("subprocess.run",
+                            lambda cmd, **k: calls.append(cmd) or MagicMock(returncode=0))
+        _cmd_push("/some/local/path", None)
+        assert any("~/workspace/" in str(c) for c in calls)
+
+    def test_push_uses_specified_remote_path(self, mock_config, monkeypatch):
+        from plugins.dgx.cli import _cmd_push
+        calls = []
+        monkeypatch.setattr("subprocess.run",
+                            lambda cmd, **k: calls.append(cmd) or MagicMock(returncode=0))
+        _cmd_push("/local/path", "~/code/myproject/")
+        assert any("~/code/myproject/" in str(c) for c in calls)
+
+    def test_push_returns_1_when_rsync_not_found(self, mock_config, monkeypatch, capsys):
+        from plugins.dgx.cli import _cmd_push
+        monkeypatch.setattr("subprocess.run", MagicMock(side_effect=FileNotFoundError))
+        ret = _cmd_push("/some/path", None)
+        assert ret == 1
+        assert "rsync not found" in capsys.readouterr().out
+
 
 class TestTier2Doctor:
-    @pytest.mark.xfail(reason="T2: doctor not implemented", strict=True)
+    def _all_ok(self):
+        """Mock SSH returning ok for all calls."""
+        def _ssh(u, h, cmd, **k):
+            if cmd == "echo ok":
+                return (True, "ok")
+            # nvidia-smi call
+            return (True, "0, NVIDIA GH200, 20480, 98304, 25")
+        return _ssh
+
     def test_doctor_reports_all_checks(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_doctor
-        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (True, "ok"))
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", self._all_ok())
+        monkeypatch.setattr("plugins.dgx.cli._get_json",
+                            lambda url, **k: ({"models": [], "data": []}, None))
         monkeypatch.setattr("plugins.dgx.cli._check_endpoint", lambda *a, **k: (True, "ok"))
         ret = _cmd_doctor()
         out = capsys.readouterr().out
@@ -528,13 +581,72 @@ class TestTier2Doctor:
             assert check.lower() in out.lower(), f"missing check: {check}"
         assert ret == 0
 
-    @pytest.mark.xfail(reason="T2: doctor not implemented", strict=True)
     def test_doctor_returns_nonzero_when_ssh_unreachable(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_doctor
         monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (False, "refused"))
+        monkeypatch.setattr("plugins.dgx.cli._get_json", lambda *a, **k: (None, "refused"))
         monkeypatch.setattr("plugins.dgx.cli._check_endpoint", lambda *a, **k: (False, "refused"))
         ret = _cmd_doctor()
         assert ret != 0
+
+    def test_doctor_returns_nonzero_when_all_inference_down(self, mock_config, monkeypatch, capsys):
+        from plugins.dgx.cli import _cmd_doctor
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", self._all_ok())
+        monkeypatch.setattr("plugins.dgx.cli._get_json", lambda *a, **k: (None, "refused"))
+        monkeypatch.setattr("plugins.dgx.cli._check_endpoint", lambda *a, **k: (False, "ok"))
+        ret = _cmd_doctor()
+        assert ret != 0
+
+    def test_doctor_passes_when_litellm_down_but_ollama_ok(self, mock_config, monkeypatch, capsys):
+        from plugins.dgx.cli import _cmd_doctor
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", self._all_ok())
+        def _get(url, **k):
+            if "api/tags" in url:
+                return ({"models": []}, None)
+            if "v1/models" in url:
+                return (None, "refused")   # vLLM down
+            return (None, "refused")
+        monkeypatch.setattr("plugins.dgx.cli._get_json", _get)
+        monkeypatch.setattr("plugins.dgx.cli._check_endpoint", lambda *a, **k: (False, "key required"))
+        ret = _cmd_doctor()
+        # Ollama up → inference_ok → passes
+        assert ret == 0
+
+
+class TestTier2Watch:
+    def test_watch_exits_cleanly_on_keyboard_interrupt(self, mock_config, monkeypatch):
+        import time
+        from plugins.dgx.cli import _cmd_watch
+
+        call_count = [0]
+
+        def _fake_ssh_run(*a, **k):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt
+            return (True, "0, A100, 20480, 40960, 50")
+
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", _fake_ssh_run)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        ret = _cmd_watch(interval=0)
+        assert ret == 0
+
+    def test_watch_handles_ssh_failure_gracefully(self, mock_config, monkeypatch, capsys):
+        import time
+        from plugins.dgx.cli import _cmd_watch
+
+        call_count = [0]
+
+        def _fail_then_interrupt(*a, **k):
+            call_count[0] += 1
+            if call_count[0] >= 2:
+                raise KeyboardInterrupt
+            return (False, "connection refused")
+
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", _fail_then_interrupt)
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        ret = _cmd_watch(interval=0)
+        assert ret == 0
 
 
 # ---------------------------------------------------------------------------

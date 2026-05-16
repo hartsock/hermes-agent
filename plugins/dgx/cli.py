@@ -9,6 +9,10 @@ Wires ``hermes dgx <subcommand>``:
   pull      — pull a model into Ollama on the DGX (streaming)
   rm        — remove a model from Ollama on the DGX
   ps        — show models currently loaded in GPU memory
+  run       — run an arbitrary command on the DGX over SSH (streaming)
+  push      — rsync local files to the DGX workspace
+  doctor    — comprehensive health check: SSH, GPU, endpoints
+  watch     — live nvidia-smi refresh until Ctrl+C
 """
 
 from __future__ import annotations
@@ -83,6 +87,20 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 
     subs.add_parser("ps", help="Show models currently loaded in GPU memory")
 
+    run_p = subs.add_parser("run", help="Run a command on the DGX over SSH (streaming)")
+    run_p.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run")
+
+    push_p = subs.add_parser("push", help="rsync local files to the DGX workspace")
+    push_p.add_argument("local", help="Local path to sync")
+    push_p.add_argument("remote", nargs="?", default=None,
+                        help="Remote destination (default: ~/workspace/)")
+
+    subs.add_parser("doctor", help="Comprehensive health check: SSH, GPU, endpoints")
+
+    watch_p = subs.add_parser("watch", help="Live nvidia-smi refresh until Ctrl+C")
+    watch_p.add_argument("--interval", "-n", type=int, default=2,
+                         help="Refresh interval in seconds (default: 2)")
+
     subparser.set_defaults(func=dgx_command)
 
 
@@ -111,6 +129,18 @@ def dgx_command(args: argparse.Namespace) -> int:
         return _cmd_rm(model=args.model, force=getattr(args, "force", False))
     if sub == "ps":
         return _cmd_ps()
+    if sub == "run":
+        cmd = " ".join(args.cmd) if args.cmd else ""
+        if not cmd:
+            print("usage: hermes dgx run <command>")
+            return 2
+        return _cmd_run(cmd)
+    if sub == "push":
+        return _cmd_push(local=args.local, remote=args.remote)
+    if sub == "doctor":
+        return _cmd_doctor()
+    if sub == "watch":
+        return _cmd_watch(interval=getattr(args, "interval", 2))
     print(f"unknown subcommand: {sub}")
     return 2
 
@@ -242,6 +272,177 @@ def _cmd_ps() -> int:
 
 
 # ---------------------------------------------------------------------------
+# hermes dgx run
+# ---------------------------------------------------------------------------
+
+def _cmd_run(cmd: str) -> int:
+    dgx = load_dgx_config()
+    rc = _ssh_stream(dgx["ssh_user"], dgx["host"], cmd)
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx push
+# ---------------------------------------------------------------------------
+
+def _cmd_push(local: str, remote: Optional[str]) -> int:
+    dgx = load_dgx_config()
+    remote_path = remote or "~/workspace/"
+    dest = f"{dgx['ssh_user']}@{dgx['host']}:{remote_path}"
+    print(f"Pushing {local}")
+    print(f"     → {dest}")
+    try:
+        result = subprocess.run(
+            ["rsync", "-avz", "--progress", local, dest],
+            timeout=300,
+        )
+        return result.returncode
+    except FileNotFoundError:
+        print("rsync not found — install rsync to use this command")
+        return 1
+    except subprocess.TimeoutExpired:
+        print("rsync timed out")
+        return 1
+    except Exception as e:
+        print(f"push failed: {e}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx doctor
+# ---------------------------------------------------------------------------
+
+_CHECK_OK  = "✓"
+_CHECK_FAIL = "✗"
+
+
+def _cmd_doctor() -> int:
+    dgx = load_dgx_config()
+    host = dgx["host"]
+    user = dgx["ssh_user"]
+
+    print("hermes dgx doctor")
+    print("─────────────────")
+
+    failures: List[str] = []
+
+    # --- SSH ---
+    ok, out = _ssh_run(user, host, "echo ok", timeout=8)
+    sym = _CHECK_OK if ok else _CHECK_FAIL
+    print(f"  SSH         {user}@{host}  {sym}")
+    if not ok:
+        print(f"              ({out})")
+        failures.append("ssh")
+
+    # --- GPU ---
+    gpu_ok, gpu_out = _ssh_run(
+        user, host,
+        "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu "
+        "--format=csv,noheader,nounits",
+        timeout=10,
+    )
+    sym = _CHECK_OK if gpu_ok else _CHECK_FAIL
+    print(f"  GPU         {sym}")
+    if gpu_ok and gpu_out:
+        for line in gpu_out.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 4:
+                idx, name, used, total = parts[0], parts[1], parts[2], parts[3]
+                try:
+                    free_gb = (int(total) - int(used)) / 1024
+                    print(f"              GPU {idx}  {name}  {free_gb:.0f} GB free")
+                except ValueError:
+                    print(f"              GPU {idx}  {name}  {used}/{total} MiB")
+    elif not gpu_ok:
+        failures.append("gpu")
+
+    # --- Ollama ---
+    obase = ollama_base(dgx)
+    data, err = _get_json(f"{obase}/api/tags", timeout=4)
+    if data is not None:
+        n = len(data.get("models", []))
+        print(f"  Ollama      {obase}  {_CHECK_OK}  ({n} models)")
+    else:
+        print(f"  Ollama      {obase}  {_CHECK_FAIL}  ({err})")
+        failures.append("ollama")
+
+    # --- vLLM ---
+    vbase = vllm_base(dgx)
+    data, err = _get_json(f"{vbase}/v1/models", timeout=4)
+    if data is not None:
+        models = [m["id"] for m in data.get("data", [])]
+        print(f"  vLLM        {vbase}  {_CHECK_OK}  ({', '.join(models) or 'no models'})")
+    else:
+        print(f"  vLLM        {vbase}  {_CHECK_FAIL}  ({err})")
+        failures.append("vllm")
+
+    # --- LiteLLM (advisory only — key required) ---
+    lbase = litellm_base(dgx)
+    lm_ok, lm_msg = _check_endpoint(f"{lbase}/health", timeout=4)
+    sym = _CHECK_OK if lm_ok else _CHECK_FAIL
+    note = "" if lm_ok else "  (key required — see ~/.hermes/.env)"
+    print(f"  LiteLLM     {lbase}  {sym}{note}")
+
+    print()
+    # SSH failure is always fatal; all inference endpoints failing is fatal
+    inference_ok = not ({"ollama", "vllm"} <= set(failures))
+    critical_ok = "ssh" not in failures and inference_ok
+    if critical_ok:
+        print("All critical checks passed.")
+    else:
+        print("One or more critical checks FAILED — see above.")
+    return 0 if critical_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx watch
+# ---------------------------------------------------------------------------
+
+_NVIDIA_SMI_QUERY = (
+    "nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu "
+    "--format=csv,noheader,nounits"
+)
+
+
+def _print_gpu_lines(out: str) -> None:
+    """Render nvidia-smi csv output as formatted GPU rows."""
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 5:
+            idx, name, used, total, util = parts[0], parts[1], parts[2], parts[3], parts[4]
+            try:
+                bar_pct = int(used) / max(int(total), 1)
+                bar = "█" * int(bar_pct * 20) + "░" * (20 - int(bar_pct * 20))
+                print(f"  GPU {idx}  {name}")
+                print(f"  [{bar}] {used}/{total} MiB  ({util}% util)")
+            except ValueError:
+                print(f"  GPU {idx}  {name}  mem={used}/{total} MiB  util={util}%")
+
+
+def _cmd_watch(interval: int = 2) -> int:
+    """Live-refresh nvidia-smi every *interval* seconds until Ctrl+C."""
+    import time
+
+    dgx = load_dgx_config()
+    host = dgx["host"]
+    user = dgx["ssh_user"]
+
+    try:
+        while True:
+            ok, out = _ssh_run(user, host, _NVIDIA_SMI_QUERY, timeout=10)
+            print("\033[2J\033[H", end="")  # clear screen, move cursor home
+            print(f"DGX Spark GPU  {host}  —  Ctrl+C to stop\n")
+            if ok and out:
+                _print_gpu_lines(out)
+            else:
+                print(f"  (SSH unavailable: {out})")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # hermes dgx status
 # ---------------------------------------------------------------------------
 
@@ -262,18 +463,7 @@ def _cmd_status() -> int:
         "--format=csv,noheader,nounits",
     )
     if ok and out:
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
-                idx, name, used, total, util = parts[0], parts[1], parts[2], parts[3], parts[4]
-                try:
-                    bar_pct = int(used) / max(int(total), 1)
-                    bar = "█" * int(bar_pct * 20) + "░" * (20 - int(bar_pct * 20))
-                    print(f"  GPU {idx}  {name}")
-                    print(f"  [{bar}] {used}/{total} MiB  ({util}% util)")
-                except ValueError:
-                    # Some fields are [N/A] on unified-memory architectures (e.g. DGX Spark GB10)
-                    print(f"  GPU {idx}  {name}  mem={used}/{total} MiB  util={util}%")
+        _print_gpu_lines(out)
     else:
         print(f"  (SSH unavailable: {out})")
     print()
