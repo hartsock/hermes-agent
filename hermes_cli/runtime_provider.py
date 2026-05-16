@@ -43,6 +43,15 @@ def _loopback_hostname(host: str) -> bool:
     return h in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
 
+# Provider aliases that all resolve to "custom" (local/LAN endpoints).
+# Used both in _config_base_url_trustworthy_for_bare_custom and at the call
+# site in _resolve_openrouter_runtime so that `provider: ollama` in config.yaml
+# correctly applies model.base_url instead of falling through to openrouter.
+_CUSTOM_PROVIDER_ALIASES: frozenset[str] = frozenset(
+    {"custom", "ollama", "vllm", "llamacpp", "llama-cpp", "llama.cpp"}
+)
+
+
 def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider: str) -> bool:
     """Decide whether ``model.base_url`` may back bare ``custom`` runtime resolution.
 
@@ -55,11 +64,6 @@ def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider
     (e.g. a DGX Spark at 192.168.x.x) work when set via config.yaml rather than
     requiring the CUSTOM_BASE_URL env var workaround.
     """
-    # Aliases from auth.py _PROVIDER_ALIASES that all resolve to "custom"
-    # Aliases from auth.py _PROVIDER_ALIASES that all resolve to "custom"
-    _CUSTOM_PROVIDER_ALIASES = {
-        "custom", "ollama", "vllm", "llamacpp", "llama-cpp", "llama.cpp",
-    }
     cfg_provider_norm = (cfg_provider or "").strip().lower()
     bu = (cfg_base_url or "").strip()
     if not bu:
@@ -69,7 +73,7 @@ def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider
     # a local backend.
     if base_url_host_matches(bu, "openrouter.ai"):
         return False
-    if cfg_provider_norm in _CUSTOM_PROVIDER_ALIASES:
+    if cfg_provider_norm in _CUSTOM_PROVIDER_ALIASES:  # noqa: SIM103
         return True
     return _loopback_hostname(base_url_hostname(bu))
 
@@ -663,7 +667,7 @@ def _resolve_openrouter_runtime(
         if requested_norm == "auto":
             if not cfg_provider or cfg_provider == "auto":
                 use_config_base_url = True
-        elif requested_norm == "custom" and _config_base_url_trustworthy_for_bare_custom(
+        elif requested_norm in _CUSTOM_PROVIDER_ALIASES and _config_base_url_trustworthy_for_bare_custom(
             cfg_base_url, cfg_provider
         ):
             use_config_base_url = True
