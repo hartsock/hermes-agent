@@ -52,7 +52,7 @@ DEFAULT_FORMATIONS: Dict[str, Dict[str, str]] = {
     "fast":        {"model": "nemotron-mini:4b",        "endpoint": "ollama"},
     "flagship":    {"model": "nemotron3:33b",           "endpoint": "ollama"},
     "vllm-fast":   {"model": "qwen2.5-coder-3b",       "endpoint": "vllm"},
-    "vllm-coding": {"model": "qwen2.5-coder-32b",      "endpoint": "vllm"},  # port 30881
+    "vllm-coding": {"model": "qwen2.5-coder-32b",      "endpoint": "vllm-32b"},
 }
 
 # NIM models verified to fit in 128 GB unified memory (DGX Spark GB10)
