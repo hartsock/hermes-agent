@@ -638,7 +638,31 @@ class HermesACPAgent(acp.Agent):
         )
 
     async def _send_usage_update(self, state: SessionState) -> None:
-        """Send ACP native context usage to the connected client."""
+        """Send ACP native context usage to the connected client.
+
+        Suppressed when HERMES_ACP_SUPPRESS_USAGE_UPDATE is set.
+
+        Why this knob exists: ACP's `usage_update` `sessionUpdate` was
+        renamed/reshaped during the protocol churn between SDK versions
+        — Python `agent-client-protocol` 0.9/0.10 emit it, Zed's Rust
+        SDK 0.11 dropped the variant entirely (no longer in the
+        SessionUpdate enum, even with the `unstable` feature). A client
+        deserializing the stream rejects the whole notification with
+        "unknown variant `usage_update`" and the session aborts.
+
+        Clients that *do* understand `usage_update` can leave the env
+        var unset and the behaviour is unchanged. Clients that don't
+        (e.g. anything built against the current Rust SDK) set
+        HERMES_ACP_SUPPRESS_USAGE_UPDATE=1 and the notifications
+        simply aren't sent — the only loss is the context-window
+        indicator in the client UI.
+        """
+        if os.environ.get("HERMES_ACP_SUPPRESS_USAGE_UPDATE", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return
         if not self._conn:
             return
         update = self._build_usage_update(state)
