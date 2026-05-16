@@ -27,7 +27,8 @@ DEFAULTS: Dict[str, Any] = {
     "host": "192.168.0.103",
     "ssh_user": "hartsock",
     "ollama_port": 11434,
-    "vllm_port": 30800,
+    "vllm_port": 30800,       # qwen2.5-coder-3b (always ready)
+    "vllm_32b_port": 30881,   # qwen2.5-coder-32b (larger, may still be downloading)
     "litellm_host": "192.168.0.104",
     "litellm_port": 4000,
     "active_endpoint": "ollama",
@@ -38,18 +39,20 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 ENDPOINT_LABELS = {
-    "ollama": "Ollama (direct, no auth)",
-    "vllm": "vLLM (direct, no auth)",
-    "litellm": "LiteLLM proxy (HA pool, requires API key)",
+    "ollama":    "Ollama (direct, no auth)",
+    "vllm":      "vLLM 3B (port 30800, always ready)",
+    "vllm-32b":  "vLLM 32B (port 30881, qwen2.5-coder-32b)",
+    "litellm":   "LiteLLM proxy (HA pool, requires API key)",
 }
 
 # Predefined model formations: name → {model, endpoint}
 DEFAULT_FORMATIONS: Dict[str, Dict[str, str]] = {
-    "coding":     {"model": "qwen3-coder:30b",       "endpoint": "ollama"},
-    "reasoning":  {"model": "deepseek-r1:70b",        "endpoint": "ollama"},
-    "fast":       {"model": "nemotron-mini:4b",        "endpoint": "ollama"},
-    "flagship":   {"model": "nemotron3:33b",           "endpoint": "ollama"},
-    "vllm-coder": {"model": "qwen2.5-coder-3b",       "endpoint": "vllm"},
+    "coding":      {"model": "qwen3-coder:30b",       "endpoint": "ollama"},
+    "reasoning":   {"model": "deepseek-r1:70b",        "endpoint": "ollama"},
+    "fast":        {"model": "nemotron-mini:4b",        "endpoint": "ollama"},
+    "flagship":    {"model": "nemotron3:33b",           "endpoint": "ollama"},
+    "vllm-fast":   {"model": "qwen2.5-coder-3b",       "endpoint": "vllm"},
+    "vllm-coding": {"model": "qwen2.5-coder-32b",      "endpoint": "vllm"},  # port 30881
 }
 
 # NIM models verified to fit in 128 GB unified memory (DGX Spark GB10)
@@ -136,6 +139,10 @@ def apply_endpoint(dgx: Dict[str, Any], endpoint: Optional[str] = None) -> None:
         provider = "ollama"
     elif ep == "vllm":
         base_url = f"http://{host}:{node['vllm_port']}/v1"
+        provider = "custom"
+    elif ep == "vllm-32b":
+        port = dgx.get("vllm_32b_port", 30881)
+        base_url = f"http://{host}:{port}/v1"
         provider = "custom"
     elif ep == "litellm":
         lh = dgx.get("litellm_host", "192.168.0.104")

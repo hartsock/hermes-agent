@@ -77,7 +77,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     ep_p.add_argument(
         "name",
-        choices=["ollama", "vllm", "litellm"],
+        choices=["ollama", "vllm", "vllm-32b", "litellm"],
         help="Endpoint to activate",
     )
 
@@ -742,12 +742,23 @@ def _cmd_setup() -> int:
         print(f"  LiteLLM http://{litellm_host}:{litellm_port}  ✗  (unreachable — key required; set OPENAI_API_KEY in ~/.hermes/.env)")
     print()
 
+    # --- Probe vLLM 32B (port 30881) ---
+    vllm_32b_port = int(_prompt("vLLM 32B port", current.get("vllm_32b_port", DEFAULTS["vllm_32b_port"])))
+    vllm_32b_ok, vllm_32b_models = _probe_vllm(host, vllm_32b_port)
+    if vllm_32b_ok:
+        print(f"  vLLM 32B http://{host}:{vllm_32b_port}  ✓  ({', '.join(vllm_32b_models)})")
+    else:
+        print(f"  vLLM 32B http://{host}:{vllm_32b_port}  ✗  (not ready yet — model may still be downloading)")
+    print()
+
     # --- Choose default endpoint ---
     available = []
     if ollama_ok:
         available.append("ollama")
     if vllm_ok:
         available.append("vllm")
+    if vllm_32b_ok:
+        available.append("vllm-32b")
     if litellm_ok:
         available.append("litellm")
 
