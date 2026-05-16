@@ -366,17 +366,16 @@ def _cmd_setup() -> int:
     ollama_ok, ollama_models = _probe_ollama(host, ollama_port)
     vllm_ok, vllm_models = _probe_vllm(host, vllm_port)
 
-    print(f"  Ollama  http://{host}:{ollama_port}  {'✓' if ollama_ok else '✗'}", end="")
     if ollama_ok:
-        print(f"  ({len(ollama_models)} models: {', '.join(ollama_models[:3])}{'...' if len(ollama_models) > 3 else ''})")
+        summary = f"({len(ollama_models)} models: {', '.join(ollama_models[:3])}{'...' if len(ollama_models) > 3 else ''})"
+        print(f"  Ollama  http://{host}:{ollama_port}  ✓  {summary}")
     else:
-        print("  (unreachable — check host/port or VPN)")
+        print(f"  Ollama  http://{host}:{ollama_port}  ✗  (unreachable — check host/port or VPN)")
 
-    print(f"  vLLM    http://{host}:{vllm_port}   {'✓' if vllm_ok else '✗'}", end="")
     if vllm_ok:
-        print(f"  ({', '.join(vllm_models)})")
+        print(f"  vLLM    http://{host}:{vllm_port}  ✓  ({', '.join(vllm_models)})")
     else:
-        print("  (unreachable)")
+        print(f"  vLLM    http://{host}:{vllm_port}  ✗  (unreachable)")
     print()
 
     # --- LiteLLM (optional) ---
@@ -384,11 +383,10 @@ def _cmd_setup() -> int:
     litellm_host = _prompt("LiteLLM host", current.get("litellm_host", DEFAULTS["litellm_host"]))
     litellm_port = int(_prompt("LiteLLM port", current.get("litellm_port", DEFAULTS["litellm_port"])))
     litellm_ok = _probe_litellm(litellm_host, litellm_port)
-    print(f"  LiteLLM http://{litellm_host}:{litellm_port}  {'✓' if litellm_ok else '✗'}", end="")
-    if not litellm_ok:
-        print("  (unreachable — key required; set OPENAI_API_KEY in ~/.hermes/.env)")
+    if litellm_ok:
+        print(f"  LiteLLM http://{litellm_host}:{litellm_port}  ✓")
     else:
-        print()
+        print(f"  LiteLLM http://{litellm_host}:{litellm_port}  ✗  (unreachable — key required; set OPENAI_API_KEY in ~/.hermes/.env)")
     print()
 
     # --- Choose default endpoint ---
