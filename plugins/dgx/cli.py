@@ -105,8 +105,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
                          help="Refresh interval in seconds (default: 2)")
 
     form_p = subs.add_parser("formation", help="Switch to a predefined model formation")
-    form_p.add_argument("name", help=f"Formation name: {', '.join(DEFAULT_FORMATIONS)}")
-    form_p.add_argument("--list", action="store_true", help="List available formations")
+    form_p.add_argument("name", nargs="?", default=None,
+                        help=f"Formation name: {', '.join(DEFAULT_FORMATIONS)}")
+    form_p.add_argument("--list", "-l", action="store_true", help="List available formations")
 
     nim_p = subs.add_parser("nim", help="NVIDIA NIM model management for the DGX")
     nim_subs = nim_p.add_subparsers(dest="nim_command")
@@ -169,7 +170,7 @@ def dgx_command(args: argparse.Namespace) -> int:
     if sub == "watch":
         return _cmd_watch(interval=getattr(args, "interval", 2))
     if sub == "formation":
-        if getattr(args, "list", False):
+        if getattr(args, "list", False) or args.name is None:
             return _cmd_formation_list()
         return _cmd_formation(name=args.name)
     if sub == "nim":
