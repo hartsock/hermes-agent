@@ -63,12 +63,17 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
 
     use_p = subs.add_parser("use", help="Switch the active model")
-    use_p.add_argument("model", help="Model name (e.g. qwen2.5-coder:latest)")
+    use_p.add_argument("model", nargs="?", default=None,
+                       help="Model name (e.g. qwen2.5-coder:latest)")
     use_p.add_argument(
         "--endpoint",
-        choices=["ollama", "vllm"],
+        choices=["ollama", "vllm", "vllm-32b", "litellm"],
         default=None,
         help="Endpoint to use for this model (auto-detected if omitted)",
+    )
+    use_p.add_argument(
+        "--for", dest="task", default=None, metavar="TASK",
+        help="Describe a task and let the router pick the best model",
     )
 
     ep_p = subs.add_parser(
@@ -117,6 +122,16 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     nim_deploy_p.add_argument("--port", type=int, default=8010, help="Host port for the NIM service (default: 8010)")
     nim_deploy_p.add_argument("--apply", action="store_true", help="Apply the manifest to the k3s cluster on nuc")
 
+    route_p = subs.add_parser(
+        "route",
+        help="Recommend the best formation for a task (smart router)",
+    )
+    route_p.add_argument("task", help="Task description, e.g. 'implement OAuth2 login'")
+    route_p.add_argument("--apply", "-a", action="store_true",
+                         help="Apply the recommended formation immediately")
+    route_p.add_argument("--check", "-c", action="store_true",
+                         help="Probe endpoints before recommending (slower but accurate)")
+
     node_p = subs.add_parser("node", help="Manage multiple DGX nodes")
     node_subs = node_p.add_subparsers(dest="node_command")
     node_subs.add_parser("list", help="List configured DGX nodes")
@@ -148,7 +163,18 @@ def dgx_command(args: argparse.Namespace) -> int:
     if sub == "models":
         return _cmd_models()
     if sub == "use":
+        if getattr(args, "task", None) and not args.model:
+            return _cmd_route(task=args.task, apply=True, check_endpoints=False)
+        if not args.model:
+            print("usage: hermes dgx use <model>  OR  hermes dgx use --for '<task>'")
+            return 2
         return _cmd_use(model=args.model, endpoint=getattr(args, "endpoint", None))
+    if sub == "route":
+        return _cmd_route(
+            task=args.task,
+            apply=getattr(args, "apply", False),
+            check_endpoints=getattr(args, "check", False),
+        )
     if sub == "endpoint":
         return _cmd_endpoint(name=args.name)
     if sub == "pull":
@@ -657,6 +683,53 @@ def _print_model_summary(dgx: Dict[str, Any], endpoint: str) -> None:
     print(f"  base_url : {model.get('base_url', '(not set)')}")
     print(f"  provider : {model.get('provider', '(not set)')}")
     print(f"  model    : {model.get('default', '(not set)')}")
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx route
+# ---------------------------------------------------------------------------
+
+_TIER_LABELS = {
+    "fast":     "fast     (simple/short task)",
+    "standard": "standard (single-concern task)",
+    "complex":  "complex  (multi-step or cross-cutting)",
+    "review":   "review   (audit / bug hunt / code quality)",
+}
+
+
+def _cmd_route(task: str, apply: bool = False, check_endpoints: bool = False) -> int:
+    from plugins.dgx.router import Tier, classify, recommend
+
+    result = recommend(task, check_endpoints=check_endpoints)
+    tier_label = _TIER_LABELS.get(result.tier, result.tier)
+
+    print()
+    print("Task analysis")
+    print("─────────────")
+    print(f"  Input      : {task}")
+    print(f"  Complexity : {tier_label}")
+    print()
+    print(f"  Formation  : {result.formation}")
+    print(f"  Model      : {result.model}")
+    print(f"  Endpoint   : {result.endpoint}  ({ENDPOINT_LABELS.get(result.endpoint, result.endpoint)})")
+    if result.fallback:
+        dgx = load_dgx_config()
+        all_formations = dict(DEFAULTS)
+        from plugins.dgx._dgx_config import DEFAULT_FORMATIONS
+        all_formations = dict(DEFAULT_FORMATIONS)
+        all_formations.update(dgx.get("formations") or {})
+        fb_spec = all_formations.get(result.fallback, {})
+        print(f"  Fallback   : {result.fallback} ({fb_spec.get('model', '?')} via {fb_spec.get('endpoint', '?')})")
+    print()
+    print(f"  Why        : {result.reason}")
+    print()
+
+    if apply:
+        return _cmd_formation(result.formation)
+
+    print(f"  Apply now  : hermes dgx formation {result.formation}")
+    print(f"  Or         : hermes dgx route '{task}' --apply")
+    return 0
 
 
 # ---------------------------------------------------------------------------
