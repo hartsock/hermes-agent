@@ -654,76 +654,184 @@ class TestTier2Watch:
 # ---------------------------------------------------------------------------
 
 class TestTier3AgentTools:
-    @pytest.mark.xfail(reason="T3: agent tools not implemented", strict=True)
+    def _registered_tools(self):
+        from plugins.dgx import register
+        tools = []
+
+        class FakeCtx:
+            def register_cli_command(self, **k): pass
+            def register_tool(self, name, **k): tools.append(name)
+
+        register(FakeCtx())
+        return tools
+
     def test_dgx_gpu_status_tool_registered(self):
-        """Plugin registration should include dgx_gpu_status as an agent tool."""
-        from plugins.dgx import register
-        registered_tools = []
+        assert "dgx_gpu_status" in self._registered_tools()
 
-        class FakeCtx:
-            def register_cli_command(self, **k): pass
-            def register_tool(self, name, **k): registered_tools.append(name)
-
-        register(FakeCtx())
-        assert "dgx_gpu_status" in registered_tools
-
-    @pytest.mark.xfail(reason="T3: agent tools not implemented", strict=True)
     def test_dgx_run_tool_registered(self):
-        from plugins.dgx import register
-        registered_tools = []
+        assert "dgx_run" in self._registered_tools()
 
-        class FakeCtx:
-            def register_cli_command(self, **k): pass
-            def register_tool(self, name, **k): registered_tools.append(name)
-
-        register(FakeCtx())
-        assert "dgx_run" in registered_tools
-
-    @pytest.mark.xfail(reason="T3: agent tools not implemented", strict=True)
     def test_dgx_pull_model_tool_registered(self):
-        from plugins.dgx import register
-        registered_tools = []
+        assert "dgx_pull_model" in self._registered_tools()
 
-        class FakeCtx:
-            def register_cli_command(self, **k): pass
-            def register_tool(self, name, **k): registered_tools.append(name)
+    def test_handle_dgx_run_calls_ssh(self, mock_config, monkeypatch):
+        from plugins.dgx.tools import handle_dgx_run
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda u, h, cmd, **k: (True, "hello from dgx"))
+        out = handle_dgx_run(command="echo hello")
+        assert "hello from dgx" in out
 
-        register(FakeCtx())
-        assert "dgx_pull_model" in registered_tools
+    def test_handle_dgx_run_returns_error_on_failure(self, mock_config, monkeypatch):
+        from plugins.dgx.tools import handle_dgx_run
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda *a, **k: (False, "connection refused"))
+        out = handle_dgx_run(command="bad-cmd")
+        assert "failed" in out.lower()
+
+    def test_handle_dgx_pull_model_success(self, mock_config, monkeypatch):
+        from plugins.dgx.tools import handle_dgx_pull_model
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda *a, **k: (True, ""))
+        out = handle_dgx_pull_model(model="nemotron3:33b")
+        assert "successfully" in out.lower()
+
+    def test_handle_dgx_pull_model_failure(self, mock_config, monkeypatch):
+        from plugins.dgx.tools import handle_dgx_pull_model
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda *a, **k: (False, "no space left"))
+        out = handle_dgx_pull_model(model="huge-model:latest")
+        assert "failed" in out.lower()
+
+    def test_handle_dgx_gpu_status_includes_gpu_line(self, mock_config, monkeypatch):
+        from plugins.dgx.tools import handle_dgx_gpu_status
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda u, h, cmd, **k: (True, "0, A100, 20480, 40960, 50")
+                            if "nvidia-smi" in cmd else (True, ""))
+        out = handle_dgx_gpu_status()
+        assert "GPU" in out
+
+    def test_handle_dgx_run_clamps_timeout(self, mock_config, monkeypatch):
+        calls = []
+        from plugins.dgx.tools import handle_dgx_run
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run",
+                            lambda u, h, cmd, timeout=10, **k: calls.append(timeout) or (True, ""))
+        handle_dgx_run(command="sleep 1", timeout=9999)
+        assert calls[0] <= 600
 
 
 class TestTier3Formations:
-    @pytest.mark.xfail(reason="T3: formations not implemented", strict=True)
     def test_formation_subcommand_parses(self):
-        from plugins.dgx.cli import register_cli
-        p = argparse.ArgumentParser()
-        register_cli(p)
+        p = self._parser()
         ns = p.parse_args(["formation", "coding"])
         assert ns.dgx_command == "formation"
 
-    @pytest.mark.xfail(reason="T3: formations not implemented", strict=True)
     def test_formation_switches_model_and_endpoint(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_formation
+        monkeypatch.setattr("plugins.dgx._dgx_config.apply_endpoint", lambda *a, **k: None)
         monkeypatch.setattr("plugins.dgx.cli.apply_endpoint", lambda *a, **k: None)
         ret = _cmd_formation("coding")
         out = capsys.readouterr().out
         assert ret == 0
         assert "coding" in out.lower()
 
+    def test_formation_rejects_unknown_name(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_formation
+        ret = _cmd_formation("nonexistent")
+        assert ret != 0
+
+    def test_formation_list_shows_all_defaults(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_formation_list
+        _cmd_formation_list()
+        out = capsys.readouterr().out
+        for name in ("coding", "reasoning", "fast", "flagship"):
+            assert name in out
+
+    def test_formation_list_flag_parses(self):
+        p = self._parser()
+        ns = p.parse_args(["formation", "coding", "--list"])
+        assert ns.list is True
+
+    def _parser(self):
+        from plugins.dgx.cli import register_cli
+        p = argparse.ArgumentParser()
+        register_cli(p)
+        return p
+
 
 class TestTier3NIM:
-    @pytest.mark.xfail(reason="T3: NIM integration not implemented", strict=True)
-    def test_nim_list_subcommand_parses(self):
+    def _parser(self):
         from plugins.dgx.cli import register_cli
         p = argparse.ArgumentParser()
         register_cli(p)
-        ns = p.parse_args(["nim", "list"])
-        assert ns.dgx_command == "nim"
+        return p
 
-    @pytest.mark.xfail(reason="T3: NIM integration not implemented", strict=True)
+    def test_nim_list_subcommand_parses(self):
+        ns = self._parser().parse_args(["nim", "list"])
+        assert ns.dgx_command == "nim"
+        assert ns.nim_command == "list"
+
     def test_nim_deploy_subcommand_parses_model(self):
+        ns = self._parser().parse_args(["nim", "deploy", "nvidia/nemotron-3-super-120b-a12b"])
+        assert ns.model == "nvidia/nemotron-3-super-120b-a12b"
+
+    def test_nim_deploy_default_port(self):
+        ns = self._parser().parse_args(["nim", "deploy", "nvidia/nemotron-nano-9b-v2"])
+        assert ns.port == 8010
+
+    def test_nim_deploy_custom_port(self):
+        ns = self._parser().parse_args(["nim", "deploy", "nvidia/nemotron-nano-9b-v2", "--port", "9000"])
+        assert ns.port == 9000
+
+    def test_nim_list_prints_catalog(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_nim_list
+        _cmd_nim_list()
+        out = capsys.readouterr().out
+        assert "nvidia/" in out
+        assert "nemotron" in out
+
+    def test_nim_deploy_prints_manifest(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_nim_deploy
+        ret = _cmd_nim_deploy("nvidia/nemotron-nano-9b-v2", port=8010, apply=False)
+        out = capsys.readouterr().out
+        assert "kind: Deployment" in out
+        assert "nvidia/nemotron-nano-9b-v2" in out
+        assert ret == 0
+
+
+class TestTier3Node:
+    def _parser(self):
         from plugins.dgx.cli import register_cli
         p = argparse.ArgumentParser()
         register_cli(p)
-        ns = p.parse_args(["nim", "deploy", "nvidia/nemotron-3-super-120b-a12b"])
-        assert hasattr(ns, "model")
+        return p
+
+    def test_node_list_subcommand_parses(self):
+        ns = self._parser().parse_args(["node", "list"])
+        assert ns.dgx_command == "node"
+        assert ns.node_command == "list"
+
+    def test_node_add_subcommand_parses(self):
+        ns = self._parser().parse_args(["node", "add", "spark2", "192.168.0.105"])
+        assert ns.name == "spark2"
+        assert ns.host == "192.168.0.105"
+
+    def test_node_use_subcommand_parses(self):
+        ns = self._parser().parse_args(["node", "use", "spark2"])
+        assert ns.name == "spark2"
+
+    def test_node_add_persists_to_config(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_node_add
+        ret = _cmd_node_add("spark2", "192.168.0.105")
+        assert ret == 0
+        assert "spark2" in mock_config.get("dgx", {}).get("nodes", {})
+
+    def test_node_list_shows_default_node(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_node_list
+        _cmd_node_list()
+        out = capsys.readouterr().out
+        assert "192.168.0.103" in out
+
+    def test_node_use_rejects_unknown(self, mock_config, capsys):
+        from plugins.dgx.cli import _cmd_node_use
+        ret = _cmd_node_use("nonexistent")
+        assert ret != 0

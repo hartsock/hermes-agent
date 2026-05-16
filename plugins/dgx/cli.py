@@ -26,9 +26,12 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from plugins.dgx._dgx_config import (
+    DEFAULT_FORMATIONS,
     DEFAULTS,
     ENDPOINT_LABELS,
+    NIM_CATALOG,
     apply_endpoint,
+    list_nodes,
     litellm_base,
     load_dgx_config,
     ollama_base,
@@ -101,6 +104,30 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     watch_p.add_argument("--interval", "-n", type=int, default=2,
                          help="Refresh interval in seconds (default: 2)")
 
+    form_p = subs.add_parser("formation", help="Switch to a predefined model formation")
+    form_p.add_argument("name", help=f"Formation name: {', '.join(DEFAULT_FORMATIONS)}")
+    form_p.add_argument("--list", action="store_true", help="List available formations")
+
+    nim_p = subs.add_parser("nim", help="NVIDIA NIM model management for the DGX")
+    nim_subs = nim_p.add_subparsers(dest="nim_command")
+    nim_subs.add_parser("list", help="List NIM models that fit in 128 GB unified memory")
+    nim_deploy_p = nim_subs.add_parser("deploy", help="Generate (and optionally apply) a NIM k8s manifest")
+    nim_deploy_p.add_argument("model", help="NIM model ID (e.g. nvidia/nemotron-3-super-120b-a12b)")
+    nim_deploy_p.add_argument("--port", type=int, default=8010, help="Host port for the NIM service (default: 8010)")
+    nim_deploy_p.add_argument("--apply", action="store_true", help="Apply the manifest to the k3s cluster on nuc")
+
+    node_p = subs.add_parser("node", help="Manage multiple DGX nodes")
+    node_subs = node_p.add_subparsers(dest="node_command")
+    node_subs.add_parser("list", help="List configured DGX nodes")
+    node_add_p = node_subs.add_parser("add", help="Add a new DGX node")
+    node_add_p.add_argument("name", help="Node name (e.g. spark1)")
+    node_add_p.add_argument("host", help="IP address or hostname")
+    node_add_p.add_argument("--ssh-user", default="hartsock", help="SSH user (default: hartsock)")
+    node_add_p.add_argument("--ollama-port", type=int, default=11434)
+    node_add_p.add_argument("--vllm-port", type=int, default=30800)
+    node_use_p = node_subs.add_parser("use", help="Switch the active DGX node")
+    node_use_p.add_argument("name", help="Node name to activate")
+
     subparser.set_defaults(func=dgx_command)
 
 
@@ -141,6 +168,37 @@ def dgx_command(args: argparse.Namespace) -> int:
         return _cmd_doctor()
     if sub == "watch":
         return _cmd_watch(interval=getattr(args, "interval", 2))
+    if sub == "formation":
+        if getattr(args, "list", False):
+            return _cmd_formation_list()
+        return _cmd_formation(name=args.name)
+    if sub == "nim":
+        nim_sub = getattr(args, "nim_command", None)
+        if nim_sub == "list":
+            return _cmd_nim_list()
+        if nim_sub == "deploy":
+            return _cmd_nim_deploy(
+                model=args.model,
+                port=getattr(args, "port", 8010),
+                apply=getattr(args, "apply", False),
+            )
+        print("usage: hermes dgx nim {list,deploy}")
+        return 2
+    if sub == "node":
+        node_sub = getattr(args, "node_command", None)
+        if node_sub == "list":
+            return _cmd_node_list()
+        if node_sub == "add":
+            return _cmd_node_add(
+                name=args.name, host=args.host,
+                ssh_user=getattr(args, "ssh_user", "hartsock"),
+                ollama_port=getattr(args, "ollama_port", 11434),
+                vllm_port=getattr(args, "vllm_port", 30800),
+            )
+        if node_sub == "use":
+            return _cmd_node_use(name=args.name)
+        print("usage: hermes dgx node {list,add,use}")
+        return 2
     print(f"unknown subcommand: {sub}")
     return 2
 
@@ -771,6 +829,207 @@ def _cmd_setup() -> int:
     print("  hermes dgx status    — verify GPU and endpoint health")
     print("  hermes dgx models    — browse available models")
     print("  hermes               — start chatting")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx formation
+# ---------------------------------------------------------------------------
+
+def _cmd_formation_list() -> int:
+    dgx = load_dgx_config()
+    all_formations = dict(DEFAULT_FORMATIONS)
+    all_formations.update(dgx.get("formations") or {})
+    active_model = dgx.get("default_model", "")
+    print("Available formations:")
+    for name, spec in all_formations.items():
+        marker = " ◀ active" if spec["model"] == active_model else ""
+        print(f"  {name:<14} {spec['model']:<35} via {spec['endpoint']}{marker}")
+    return 0
+
+
+def _cmd_formation(name: str) -> int:
+    dgx = load_dgx_config()
+    all_formations = dict(DEFAULT_FORMATIONS)
+    all_formations.update(dgx.get("formations") or {})
+
+    if name not in all_formations:
+        available = ", ".join(all_formations)
+        print(f"Unknown formation {name!r}. Available: {available}")
+        return 1
+
+    spec = all_formations[name]
+    model = spec["model"]
+    endpoint = spec["endpoint"]
+
+    apply_endpoint(dgx, endpoint)
+
+    from hermes_cli.config import load_config, save_config
+    cfg = load_config()
+    if not isinstance(cfg.get("model"), dict):
+        cfg["model"] = {}
+    cfg["model"]["default"] = model
+    dgx["default_model"] = model
+    dgx["active_endpoint"] = endpoint
+    to_save = {k: v for k, v in dgx.items() if not k.startswith("_")}
+    cfg["dgx"] = to_save
+    save_config(cfg)
+
+    print(f"Formation : {name}")
+    print(f"Model     : {model}")
+    print(f"Endpoint  : {endpoint}  ({ENDPOINT_LABELS.get(endpoint, endpoint)})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx nim
+# ---------------------------------------------------------------------------
+
+def _cmd_nim_list() -> int:
+    print(f"{'MODEL ID':<50} {'PARAMS':<14} {'TIER'}")
+    print("─" * 80)
+    for m in NIM_CATALOG:
+        print(f"  {m['id']:<48} {m['params']:<14} {m['tier']}")
+    print()
+    print("Deploy: hermes dgx nim deploy <model-id>")
+    print("Needs:  NVIDIA_API_KEY in ~/.hermes/.env or NGC_API_KEY secret in k3s")
+    return 0
+
+
+def _cmd_nim_deploy(model: str, port: int = 8010, apply: bool = False) -> int:
+    import os
+    import re
+
+    slug = re.sub(r"[^a-z0-9]", "-", model.lower()).strip("-")
+    nuc_host = load_dgx_config().get("litellm_host", "192.168.0.104")
+    nuc_user = load_dgx_config().get("ssh_user", "hartsock")
+    dgx_host = load_dgx_config().get("host", "192.168.0.103")
+
+    manifest = f"""\
+apiVersion: v1
+kind: Service
+metadata:
+  name: nim-{slug}
+  namespace: inference
+spec:
+  selector:
+    app: nim-{slug}
+  ports:
+    - port: 8000
+      nodePort: {port}
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nim-{slug}
+  namespace: inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nim-{slug}
+  template:
+    metadata:
+      labels:
+        app: nim-{slug}
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: dgx1
+      tolerations:
+        - key: gpu
+          operator: Exists
+          effect: NoSchedule
+      runtimeClassName: nvidia
+      containers:
+        - name: nim
+          image: nvcr.io/nim/{model}:latest
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NGC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ngc-api-key
+                  key: key
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+"""
+    print(manifest)
+
+    if apply:
+        import tempfile
+        tmp = f"/tmp/nim-{slug}.yaml"
+        ok, out = _ssh_run(nuc_user, nuc_host,
+                           f"cat > {tmp} << 'YAML'\n{manifest}\nYAML\nkubectl apply -f {tmp}",
+                           timeout=30)
+        if ok:
+            print(out)
+            print(f"\nNIM endpoint will be at http://{dgx_host}:{port}/v1")
+            return 0
+        print(f"Apply failed: {out}")
+        return 1
+    else:
+        print(f"# To apply: hermes dgx nim deploy {model} --apply")
+        print(f"# Or:       ssh {nuc_user}@{nuc_host} kubectl apply -f <above-manifest>")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx node
+# ---------------------------------------------------------------------------
+
+def _cmd_node_list() -> int:
+    dgx = load_dgx_config()
+    nodes = list_nodes(dgx)
+    active = dgx.get("active_node", "default")
+    print(f"{'NAME':<12} {'HOST':<18} {'SSH USER':<12} OLLAMA  vLLM")
+    print("─" * 60)
+    for nd in nodes:
+        marker = " ◀" if nd["_key"] == active else ""
+        print(f"  {nd['_key']:<10} {nd['host']:<18} {nd['ssh_user']:<12} "
+              f"{nd['ollama_port']:<7} {nd['vllm_port']}{marker}")
+    return 0
+
+
+def _cmd_node_add(name: str, host: str, ssh_user: str = "hartsock",
+                  ollama_port: int = 11434, vllm_port: int = 30800) -> int:
+    dgx = load_dgx_config()
+    nodes = dict(dgx.get("nodes") or {})
+    nodes[name] = {
+        "host": host,
+        "ssh_user": ssh_user,
+        "ollama_port": ollama_port,
+        "vllm_port": vllm_port,
+        "name": f"DGX Spark ({name})",
+    }
+    dgx["nodes"] = nodes
+    save_dgx_config(dgx)
+    print(f"Added node {name!r} → {host}")
+    return 0
+
+
+def _cmd_node_use(name: str) -> int:
+    dgx = load_dgx_config()
+    nodes = dgx.get("nodes") or {}
+    if name != "default" and name not in nodes:
+        available = list(nodes) or ["default"]
+        print(f"Unknown node {name!r}. Available: {', '.join(available)}")
+        return 1
+    dgx["active_node"] = name
+    # Also update the flat host/ports for backwards compat
+    if name in nodes:
+        nd = nodes[name]
+        dgx["host"] = nd["host"]
+        dgx["ssh_user"] = nd.get("ssh_user", "hartsock")
+        dgx["ollama_port"] = nd.get("ollama_port", 11434)
+        dgx["vllm_port"] = nd.get("vllm_port", 30800)
+        apply_endpoint(dgx, dgx.get("active_endpoint", "ollama"))
+    save_dgx_config(dgx)
+    print(f"Active node → {name}")
     return 0
 
 
