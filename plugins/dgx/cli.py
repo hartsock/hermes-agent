@@ -166,10 +166,14 @@ def _cmd_status() -> int:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) >= 5:
                 idx, name, used, total, util = parts[0], parts[1], parts[2], parts[3], parts[4]
-                bar_pct = int(used) / max(int(total), 1)
-                bar = "█" * int(bar_pct * 20) + "░" * (20 - int(bar_pct * 20))
-                print(f"  GPU {idx}  {name}")
-                print(f"  [{bar}] {used}/{total} MiB  ({util}% util)")
+                try:
+                    bar_pct = int(used) / max(int(total), 1)
+                    bar = "█" * int(bar_pct * 20) + "░" * (20 - int(bar_pct * 20))
+                    print(f"  GPU {idx}  {name}")
+                    print(f"  [{bar}] {used}/{total} MiB  ({util}% util)")
+                except ValueError:
+                    # Some fields are [N/A] on unified-memory architectures (e.g. DGX Spark GB10)
+                    print(f"  GPU {idx}  {name}  mem={used}/{total} MiB  util={util}%")
     else:
         print(f"  (SSH unavailable: {out})")
     print()
