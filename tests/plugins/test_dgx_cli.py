@@ -248,22 +248,24 @@ class TestArgparseWiring:
         with pytest.raises(SystemExit):
             p.parse_args(["endpoint", "bogus"])
 
-    # --- Tier 1: planned subcommands (red) ---
+    # --- Tier 1: implemented ---
 
-    @pytest.mark.xfail(reason="T1: hermes dgx pull not yet implemented", strict=True)
     def test_pull_subcommand_parses_model_arg(self):
         p = self._parser()
         ns = p.parse_args(["pull", "nemotron3:70b"])
         assert ns.dgx_command == "pull"
         assert ns.model == "nemotron3:70b"
 
-    @pytest.mark.xfail(reason="T1: hermes dgx rm not yet implemented", strict=True)
     def test_rm_subcommand_parses_model_arg(self):
         p = self._parser()
         ns = p.parse_args(["rm", "old-model:latest"])
         assert ns.dgx_command == "rm"
 
-    @pytest.mark.xfail(reason="T1: hermes dgx ps not yet implemented", strict=True)
+    def test_rm_force_flag(self):
+        p = self._parser()
+        ns = p.parse_args(["rm", "old-model:latest", "--force"])
+        assert ns.force is True
+
     def test_ps_subcommand_parses(self):
         p = self._parser()
         ns = p.parse_args(["ps"])
@@ -408,24 +410,28 @@ class TestCmdModels:
 # ---------------------------------------------------------------------------
 
 class TestTier1Pull:
-    @pytest.mark.xfail(reason="T1: pull not implemented", strict=True)
     def test_pull_runs_ollama_pull_via_ssh(self, mock_config, monkeypatch):
         from plugins.dgx.cli import _cmd_pull
         calls = []
-        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda u, h, cmd, **k: calls.append(cmd) or (True, ""))
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda u, h, cmd, **k: calls.append(cmd) or 0)
         _cmd_pull("nemotron3:70b")
         assert any("ollama pull nemotron3:70b" in c for c in calls)
 
-    @pytest.mark.xfail(reason="T1: pull not implemented", strict=True)
     def test_pull_returns_nonzero_on_ssh_failure(self, mock_config, monkeypatch):
         from plugins.dgx.cli import _cmd_pull
-        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (False, "ssh error"))
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda *a, **k: 1)
         ret = _cmd_pull("some-model:latest")
         assert ret != 0
 
+    def test_pull_prints_host_before_streaming(self, mock_config, monkeypatch, capsys):
+        from plugins.dgx.cli import _cmd_pull
+        monkeypatch.setattr("plugins.dgx.cli._ssh_stream", lambda *a, **k: 0)
+        _cmd_pull("gemma4:26b")
+        out = capsys.readouterr().out
+        assert "gemma4:26b" in out
+
 
 class TestTier1Rm:
-    @pytest.mark.xfail(reason="T1: rm not implemented", strict=True)
     def test_rm_runs_ollama_rm_via_ssh(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_rm
         calls = []
@@ -434,7 +440,6 @@ class TestTier1Rm:
         _cmd_rm("old-model:latest")
         assert any("ollama rm old-model:latest" in c for c in calls)
 
-    @pytest.mark.xfail(reason="T1: rm not implemented", strict=True)
     def test_rm_aborts_on_no_confirmation(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_rm
         calls = []
@@ -443,9 +448,21 @@ class TestTier1Rm:
         _cmd_rm("old-model:latest")
         assert len(calls) == 0
 
+    def test_rm_force_skips_prompt(self, mock_config, monkeypatch):
+        from plugins.dgx.cli import _cmd_rm
+        calls = []
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda u, h, cmd, **k: calls.append(cmd) or (True, ""))
+        _cmd_rm("old-model:latest", force=True)
+        assert any("ollama rm" in c for c in calls)
+
+    def test_rm_returns_nonzero_on_ssh_failure(self, mock_config, monkeypatch):
+        from plugins.dgx.cli import _cmd_rm
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (False, "error"))
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        assert _cmd_rm("bad-model:latest") != 0
+
 
 class TestTier1Ps:
-    @pytest.mark.xfail(reason="T1: ps not implemented", strict=True)
     def test_ps_shows_loaded_models(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_ps
         ollama_ps_output = "NAME\t\tID\t\tSIZE\tPROCESSOR\nnemotron3:33b\tabc123\t20 GB\tgpu"
@@ -455,12 +472,16 @@ class TestTier1Ps:
         assert "nemotron3:33b" in out
         assert ret == 0
 
-    @pytest.mark.xfail(reason="T1: ps not implemented", strict=True)
     def test_ps_graceful_when_nothing_loaded(self, mock_config, monkeypatch, capsys):
         from plugins.dgx.cli import _cmd_ps
         monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (True, "NAME\tID\tSIZE\tPROCESSOR"))
         ret = _cmd_ps()
         assert ret == 0
+
+    def test_ps_returns_1_when_ssh_fails(self, mock_config, monkeypatch, capsys):
+        from plugins.dgx.cli import _cmd_ps
+        monkeypatch.setattr("plugins.dgx.cli._ssh_run", lambda *a, **k: (False, "refused"))
+        assert _cmd_ps() == 1
 
 
 # ---------------------------------------------------------------------------

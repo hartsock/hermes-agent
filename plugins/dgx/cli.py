@@ -6,6 +6,9 @@ Wires ``hermes dgx <subcommand>``:
   models    — list models available on Ollama and vLLM
   use       — switch active model (updates config.yaml model.default)
   endpoint  — switch active endpoint (ollama / vllm / litellm)
+  pull      — pull a model into Ollama on the DGX (streaming)
+  rm        — remove a model from Ollama on the DGX
+  ps        — show models currently loaded in GPU memory
 """
 
 from __future__ import annotations
@@ -71,6 +74,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Endpoint to activate",
     )
 
+    pull_p = subs.add_parser("pull", help="Pull a model into Ollama on the DGX")
+    pull_p.add_argument("model", help="Model name (e.g. nemotron3:70b)")
+
+    rm_p = subs.add_parser("rm", help="Remove a model from Ollama on the DGX")
+    rm_p.add_argument("model", help="Model name to remove")
+    rm_p.add_argument("--force", "-f", action="store_true", help="Skip confirmation prompt")
+
+    subs.add_parser("ps", help="Show models currently loaded in GPU memory")
+
     subparser.set_defaults(func=dgx_command)
 
 
@@ -81,7 +93,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
 def dgx_command(args: argparse.Namespace) -> int:
     sub = getattr(args, "dgx_command", None)
     if not sub:
-        print("usage: hermes dgx {setup,status,models,use,endpoint}")
+        print("usage: hermes dgx {setup,status,models,use,endpoint,pull,rm,ps}")
         return 2
     if sub == "setup":
         return _cmd_setup()
@@ -93,6 +105,12 @@ def dgx_command(args: argparse.Namespace) -> int:
         return _cmd_use(model=args.model, endpoint=getattr(args, "endpoint", None))
     if sub == "endpoint":
         return _cmd_endpoint(name=args.name)
+    if sub == "pull":
+        return _cmd_pull(model=args.model)
+    if sub == "rm":
+        return _cmd_rm(model=args.model, force=getattr(args, "force", False))
+    if sub == "ps":
+        return _cmd_ps()
     print(f"unknown subcommand: {sub}")
     return 2
 
@@ -139,6 +157,88 @@ def _ssh_run(user: str, host: str, cmd: str, timeout: int = 10) -> Tuple[bool, s
         return False, "ssh not found"
     except Exception as e:
         return False, str(e)
+
+
+def _ssh_stream(user: str, host: str, cmd: str, timeout: int = 300) -> int:
+    """Run *cmd* on host via SSH, streaming stdout/stderr to the terminal.
+
+    Returns the remote exit code. Used for long-running commands like
+    ``ollama pull`` where real-time progress output matters.
+    """
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=6", "-o", "BatchMode=yes",
+             f"{user}@{host}", cmd],
+            timeout=timeout,
+        )
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        print("(ssh timed out)")
+        return 1
+    except FileNotFoundError:
+        print("ssh not found — is OpenSSH installed?")
+        return 1
+    except Exception as e:
+        print(f"ssh error: {e}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx pull
+# ---------------------------------------------------------------------------
+
+def _cmd_pull(model: str) -> int:
+    dgx = load_dgx_config()
+    print(f"Pulling {model} on dgx1 ({dgx['host']}) ...")
+    rc = _ssh_stream(dgx["ssh_user"], dgx["host"], f"ollama pull {model}")
+    if rc != 0:
+        print(f"pull failed (exit {rc})")
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx rm
+# ---------------------------------------------------------------------------
+
+def _cmd_rm(model: str, force: bool = False) -> int:
+    dgx = load_dgx_config()
+    if not force:
+        try:
+            ans = input(f"Remove {model} from {dgx['host']}? [y/N] ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("aborted")
+            return 0
+    ok, out = _ssh_run(dgx["ssh_user"], dgx["host"], f"ollama rm {model}")
+    if ok:
+        print(f"removed {model}")
+        return 0
+    print(f"rm failed: {out}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
+# hermes dgx ps
+# ---------------------------------------------------------------------------
+
+def _cmd_ps() -> int:
+    dgx = load_dgx_config()
+    ok, out = _ssh_run(dgx["ssh_user"], dgx["host"], "ollama ps", timeout=10)
+    if not ok:
+        print(f"(SSH unavailable: {out})")
+        return 1
+    lines = out.strip().splitlines()
+    # ollama ps prints a header even when empty; detect "nothing loaded" by
+    # checking whether there are any data rows after the header.
+    data_lines = [l for l in lines[1:] if l.strip()] if len(lines) > 1 else []
+    if not data_lines:
+        print("No models currently loaded in GPU memory.")
+        return 0
+    # Pass through ollama's own formatting — it already aligns columns nicely.
+    for line in lines:
+        print(f"  {line}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
