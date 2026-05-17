@@ -719,7 +719,7 @@ def _resolve_openrouter_runtime(
     # name instead of silently relabeling to "openrouter" (#2562).
     # Also provide a placeholder API key for local servers that don't require
     # authentication — the OpenAI SDK requires a non-empty api_key string.
-    effective_provider = "custom" if requested_norm == "custom" else "openrouter"
+    effective_provider = "custom" if requested_norm in _CUSTOM_PROVIDER_ALIASES else "openrouter"
 
     # For custom endpoints, check if a credential pool exists
     if effective_provider == "custom" and base_url:
