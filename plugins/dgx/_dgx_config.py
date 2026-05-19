@@ -49,12 +49,12 @@ ENDPOINT_LABELS = {
 
 # Predefined model formations: name → {model, endpoint}
 DEFAULT_FORMATIONS: Dict[str, Dict[str, str]] = {
-    "coding":      {"model": "qwen3-coder:30b",       "endpoint": "ollama"},
-    "reasoning":   {"model": "deepseek-r1:70b",        "endpoint": "ollama"},
-    "fast":        {"model": "nemotron-mini:4b",        "endpoint": "ollama"},
-    "flagship":    {"model": "nemotron3:33b",           "endpoint": "ollama"},
-    "vllm-fast":   {"model": "qwen2.5-coder-3b",       "endpoint": "vllm"},
-    "vllm-coding": {"model": "qwen2.5-coder-32b",      "endpoint": "vllm-32b"},
+    "coding":      {"model": "qwen3.6:35b-a3b-coding-nvfp4", "endpoint": "ollama"},
+    "reasoning":   {"model": "deepseek-r1:70b",               "endpoint": "ollama"},
+    "fast":        {"model": "nemotron-mini:4b",               "endpoint": "ollama"},
+    "flagship":    {"model": "qwen3.6:35b",                   "endpoint": "ollama"},
+    "vllm-fast":   {"model": "qwen2.5-coder-3b",              "endpoint": "vllm"},
+    "vllm-coding": {"model": "qwen2.5-coder-32b",             "endpoint": "vllm-32b"},
 }
 
 # NIM models verified to fit in 128 GB unified memory (DGX Spark GB10)
