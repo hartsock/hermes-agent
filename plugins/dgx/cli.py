@@ -72,6 +72,8 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     models_p.add_argument("--port", type=int, default=None,
                           help="vLLM port for 'add' (auto-assigned if omitted)")
+    models_p.add_argument("--gpu-mem", type=float, default=0.85, metavar="FRAC",
+                          help="GPU memory utilization fraction for vLLM (default: 0.85)")
     models_p.add_argument("--force", "-f", action="store_true",
                           help="Skip confirmation for 'rm'")
     models_p.add_argument("--all", dest="models_all", action="store_true",
@@ -179,7 +181,8 @@ def dgx_command(args: argparse.Namespace) -> int:
         msub = getattr(args, "models_subcommand", None)
         marg = getattr(args, "models_arg", None)
         if msub == "add":
-            return _cmd_models_add(model=marg, port=getattr(args, "port", None))
+            return _cmd_models_add(model=marg, port=getattr(args, "port", None),
+                                   gpu_mem=getattr(args, "gpu_mem", 0.85))
         if msub == "rm":
             return _cmd_models_rm(
                 model=marg,
@@ -364,10 +367,16 @@ def _find_vllm_bin(user: str, host: str) -> Optional[str]:
 
 
 def _next_vllm_port(dgx: Dict[str, Any]) -> int:
-    """Return the next unassigned vLLM port starting from 30800."""
+    """Return the next unassigned vLLM port.
+
+    Starts at 8900 to avoid the k3s NodePort range (30000-32767) which may
+    already have services mapped on the DGX. The configured vllm_port and
+    vllm_32b_port are static endpoints; dynamically-served HF models get
+    ports from 8900 upward.
+    """
     used = {dgx.get("vllm_port", 0), dgx.get("vllm_32b_port", 0)}
     used.update(s.get("port", 0) for s in (dgx.get("vllm_servers") or []))
-    port = 30800
+    port = 8900
     while port in used:
         port += 1
     return port
@@ -725,7 +734,8 @@ def _cmd_models() -> int:
     return 0 if found_any else 1
 
 
-def _cmd_models_add(model: Optional[str], port: Optional[int] = None) -> int:
+def _cmd_models_add(model: Optional[str], port: Optional[int] = None,
+                    gpu_mem: float = 0.85) -> int:
     """Pull to Ollama (short names) or start vLLM server (HF org/model IDs)."""
     if not model:
         print("usage: hermes dgx models add <model>")
@@ -764,6 +774,7 @@ def _cmd_models_add(model: Optional[str], port: Optional[int] = None) -> int:
 
     cmd = (
         f"nohup {vllm_bin} serve {model} --host 0.0.0.0 --port {use_port} "
+        f"--trust-remote-code --gpu-memory-utilization {gpu_mem:.2f} "
         f"> {log_file} 2>&1 & echo $!"
     )
     ok, pid = _ssh_run(dgx["ssh_user"], dgx["host"], cmd, timeout=12)
@@ -863,8 +874,18 @@ def _cmd_use(model: str, endpoint: Optional[str] = None) -> int:
             if any(m.startswith(model_root) for m in ollama_models):
                 endpoint = "ollama"
 
+    # If the model has a specific vLLM server, route to its port
+    port_override: Optional[int] = None
+    if _is_hf_model(model):
+        servers = dgx.get("vllm_servers") or []
+        entry = next((s for s in servers if s.get("model") == model), None)
+        if entry:
+            port_override = entry["port"]
+            if endpoint not in ("vllm", "vllm-32b", "litellm"):
+                endpoint = "vllm"
+
     dgx["default_model"] = model
-    apply_endpoint(dgx, endpoint)
+    apply_endpoint(dgx, endpoint, port_override=port_override)
 
     # Also update model.default
     cfg = load_config()
@@ -873,8 +894,9 @@ def _cmd_use(model: str, endpoint: Optional[str] = None) -> int:
     cfg["model"]["default"] = model
     save_config(cfg)
 
+    port_note = f" (port {port_override})" if port_override else ""
     print(f"Active model : {model}")
-    print(f"Endpoint     : {endpoint}  ({ENDPOINT_LABELS.get(endpoint, endpoint)})")
+    print(f"Endpoint     : {endpoint}  ({ENDPOINT_LABELS.get(endpoint, endpoint)}){port_note}")
     return 0
 
 

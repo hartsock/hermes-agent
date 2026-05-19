@@ -128,8 +128,13 @@ def save_dgx_config(dgx: Dict[str, Any]) -> None:
     save_config(cfg)
 
 
-def apply_endpoint(dgx: Dict[str, Any], endpoint: Optional[str] = None) -> None:
-    """Write model.provider + model.base_url to point at the given endpoint."""
+def apply_endpoint(dgx: Dict[str, Any], endpoint: Optional[str] = None,
+                   port_override: Optional[int] = None) -> None:
+    """Write model.provider + model.base_url to point at the given endpoint.
+
+    port_override: if set, replaces the vllm/vllm-32b port (used when a
+    specific model's vLLM server runs on a non-default port).
+    """
     from hermes_cli.config import load_config, save_config
 
     ep = endpoint or dgx.get("active_endpoint", "ollama")
@@ -140,7 +145,8 @@ def apply_endpoint(dgx: Dict[str, Any], endpoint: Optional[str] = None) -> None:
         base_url = f"http://{host}:{node['ollama_port']}/v1"
         provider = "ollama"
     elif ep == "vllm":
-        base_url = f"http://{host}:{node['vllm_port']}/v1"
+        port = port_override or node["vllm_port"]
+        base_url = f"http://{host}:{port}/v1"
         provider = "custom"
     elif ep == "vllm-32b":
         port = dgx.get("vllm_32b_port", 30881)
