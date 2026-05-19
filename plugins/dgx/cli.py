@@ -57,10 +57,25 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Show GPU memory usage, running models, and endpoint health",
     )
 
-    subs.add_parser(
+    models_p = subs.add_parser(
         "models",
-        help="List models available on Ollama and vLLM",
+        help="List and manage models (Ollama, vLLM, HF cache)",
     )
+    models_p.add_argument(
+        "models_subcommand", nargs="?",
+        choices=["add", "rm"], default=None,
+        help="add: pull to Ollama or serve HF model via vLLM; rm: remove or stop",
+    )
+    models_p.add_argument(
+        "models_arg", nargs="?", default=None,
+        help="Model name or HuggingFace org/name ID; use '--all' with rm to stop all vLLM",
+    )
+    models_p.add_argument("--port", type=int, default=None,
+                          help="vLLM port for 'add' (auto-assigned if omitted)")
+    models_p.add_argument("--force", "-f", action="store_true",
+                          help="Skip confirmation for 'rm'")
+    models_p.add_argument("--all", dest="models_all", action="store_true",
+                          help="With 'rm': stop all vLLM servers and free GPU memory")
 
     use_p = subs.add_parser("use", help="Switch the active model")
     use_p.add_argument("model", nargs="?", default=None,
@@ -161,6 +176,16 @@ def dgx_command(args: argparse.Namespace) -> int:
     if sub == "status":
         return _cmd_status()
     if sub == "models":
+        msub = getattr(args, "models_subcommand", None)
+        marg = getattr(args, "models_arg", None)
+        if msub == "add":
+            return _cmd_models_add(model=marg, port=getattr(args, "port", None))
+        if msub == "rm":
+            return _cmd_models_rm(
+                model=marg,
+                force=getattr(args, "force", False),
+                all_servers=getattr(args, "models_all", False),
+            )
         return _cmd_models()
     if sub == "use":
         if getattr(args, "task", None) and not args.model:
@@ -296,6 +321,56 @@ def _ssh_stream(user: str, host: str, cmd: str, timeout: int = 300) -> int:
     except Exception as e:
         print(f"ssh error: {e}")
         return 1
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace cache helpers
+# ---------------------------------------------------------------------------
+
+def _list_hf_models(user: str, host: str) -> List[str]:
+    """Return HuggingFace model IDs cached in ~/.cache/huggingface/hub/ on the DGX."""
+    ok, out = _ssh_run(
+        user, host,
+        "ls ~/.cache/huggingface/hub/ 2>/dev/null | grep '^models--'",
+        timeout=8,
+    )
+    if not ok or not out:
+        return []
+    models: List[str] = []
+    for line in out.splitlines():
+        name = line.strip()
+        if name.startswith("models--"):
+            name = name[len("models--"):]
+            if "--" in name:
+                idx = name.index("--")
+                models.append(name[:idx] + "/" + name[idx + 2:])
+    return models
+
+
+def _is_hf_model(model: str) -> bool:
+    """True if model looks like a HuggingFace org/name ID."""
+    return "/" in model
+
+
+def _find_vllm_bin(user: str, host: str) -> Optional[str]:
+    """Return the vllm binary path on the DGX, or None if not installed."""
+    ok, out = _ssh_run(
+        user, host,
+        "command -v vllm 2>/dev/null || ls ~/.local/bin/vllm 2>/dev/null || echo ''",
+        timeout=5,
+    )
+    path = out.strip() if ok else ""
+    return path or None
+
+
+def _next_vllm_port(dgx: Dict[str, Any]) -> int:
+    """Return the next unassigned vLLM port starting from 30800."""
+    used = {dgx.get("vllm_port", 0), dgx.get("vllm_32b_port", 0)}
+    used.update(s.get("port", 0) for s in (dgx.get("vllm_servers") or []))
+    port = 30800
+    while port in used:
+        port += 1
+    return port
 
 
 # ---------------------------------------------------------------------------
@@ -591,41 +666,181 @@ def _cmd_status() -> int:
 
 
 # ---------------------------------------------------------------------------
-# hermes dgx models
+# hermes dgx models / models add / models rm
 # ---------------------------------------------------------------------------
 
 def _cmd_models() -> int:
     dgx = load_dgx_config()
     found_any = False
 
-    # Ollama
+    # --- Ollama ---
     obase = ollama_base(dgx)
     data, err = _get_json(f"{obase}/api/tags")
     if data is not None:
         models = data.get("models", [])
         print(f"Ollama  {obase}")
         for m in models:
-            name = m["name"]
             size_gb = m.get("size", 0) / 1e9
-            print(f"  {name:<40} {size_gb:.1f} GB")
+            print(f"  {m['name']:<42} {size_gb:.1f} GB")
+        if not models:
+            print("  (no models — use: hermes dgx pull <name>)")
         found_any = True
     else:
         print(f"Ollama  {obase}  (unreachable: {err})")
     print()
 
-    # vLLM
-    vbase = vllm_base(dgx)
-    data, err = _get_json(f"{vbase}/v1/models")
-    if data is not None:
-        models = data.get("data", [])
-        print(f"vLLM    {vbase}")
-        for m in models:
-            print(f"  {m['id']}")
+    # --- vLLM servers tracked in config ---
+    servers: List[Dict[str, Any]] = dgx.get("vllm_servers") or []
+    if servers:
+        print("vLLM (tracked servers)")
+        for s in servers:
+            port = s.get("port", "?")
+            model = s.get("model", "?")
+            probe, _ = _get_json(f"http://{dgx['host']}:{port}/v1/models", timeout=3)
+            status = "✓ running" if probe is not None else "✗ stopped"
+            print(f"  {model:<50} :{port}  {status}")
+        print()
+        print("  hermes dgx models add <hf-id>          — start serving")
+        print("  hermes dgx models rm  <hf-id>          — stop + free GPU memory")
+        print("  hermes dgx models rm  --all            — stop all vLLM servers")
+    else:
+        print("vLLM (no tracked servers)")
+        print("  hermes dgx models add <org/model-id>  — serve an HF model via vLLM")
+    print()
+
+    # --- HuggingFace cache ---
+    hf_models = _list_hf_models(dgx["ssh_user"], dgx["host"])
+    served_ids = {s.get("model", "") for s in servers}
+    if hf_models:
+        print(f"HuggingFace cache  (~/.cache/huggingface/hub)  [{len(hf_models)} model(s)]")
+        for m in hf_models:
+            marker = "  ← serving via vLLM" if m in served_ids else ""
+            print(f"  {m}{marker}")
         found_any = True
     else:
-        print(f"vLLM    {vbase}  (unreachable: {err})")
+        print("HuggingFace cache  (empty)")
+        print("  Download: hermes dgx run \"hf download <org/model-id>\"")
+    print()
 
     return 0 if found_any else 1
+
+
+def _cmd_models_add(model: Optional[str], port: Optional[int] = None) -> int:
+    """Pull to Ollama (short names) or start vLLM server (HF org/model IDs)."""
+    if not model:
+        print("usage: hermes dgx models add <model>")
+        print("  Ollama : hermes dgx models add deepseek-r1:32b")
+        print("  HF/vLLM: hermes dgx models add nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16")
+        return 2
+
+    dgx = load_dgx_config()
+
+    if not _is_hf_model(model):
+        return _cmd_pull(model)
+
+    # HuggingFace model → serve via vLLM
+    vllm_bin = _find_vllm_bin(dgx["ssh_user"], dgx["host"])
+    if not vllm_bin:
+        print("vllm not found on DGX — install with:")
+        print("  hermes dgx run \"pip install --break-system-packages vllm\"")
+        return 1
+
+    use_port = port or _next_vllm_port(dgx)
+    log_file = f"/tmp/vllm-{use_port}.log"
+
+    # If already tracked, restart it
+    servers: List[Dict[str, Any]] = list(dgx.get("vllm_servers") or [])
+    existing = next((s for s in servers if s.get("model") == model), None)
+    if existing:
+        old_port = existing["port"]
+        print(f"Restarting vLLM for {model} (was port {old_port}) ...")
+        _ssh_run(dgx["ssh_user"], dgx["host"],
+                 f"fuser -k {old_port}/tcp 2>/dev/null; pkill -f 'vllm serve {model}' 2>/dev/null; true",
+                 timeout=8)
+        use_port = old_port  # keep same port on restart
+        log_file = f"/tmp/vllm-{use_port}.log"
+    else:
+        print(f"Starting vLLM for {model} on port {use_port} ...")
+
+    cmd = (
+        f"nohup {vllm_bin} serve {model} --host 0.0.0.0 --port {use_port} "
+        f"> {log_file} 2>&1 & echo $!"
+    )
+    ok, pid = _ssh_run(dgx["ssh_user"], dgx["host"], cmd, timeout=12)
+    if not ok or not (pid or "").strip().isdigit():
+        print(f"Failed to start vLLM: {pid}")
+        return 1
+
+    # Persist to config
+    servers = [s for s in servers if s.get("model") != model]
+    servers.append({"model": model, "port": use_port})
+    dgx["vllm_servers"] = servers
+    save_dgx_config(dgx)
+
+    print(f"  PID    : {pid.strip()}")
+    print(f"  Port   : {use_port}")
+    print(f"  Log    : {log_file}")
+    print()
+    print(f"  Watch  : hermes dgx run \"tail -f {log_file}\"")
+    print(f"  Use it : hermes dgx use {model} --endpoint vllm")
+    print(f"  (Model loading typically takes 30-120 s)")
+    return 0
+
+
+def _cmd_models_rm(model: Optional[str], force: bool = False,
+                   all_servers: bool = False) -> int:
+    """Stop a vLLM server (freeing GPU memory) or remove an Ollama model."""
+    dgx = load_dgx_config()
+    servers: List[Dict[str, Any]] = list(dgx.get("vllm_servers") or [])
+
+    # --all: stop every tracked vLLM server
+    if all_servers:
+        if not servers:
+            print("No tracked vLLM servers to stop.")
+            return 0
+        if not force:
+            try:
+                ans = input(f"Stop all {len(servers)} vLLM server(s) and free GPU memory? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans not in ("y", "yes"):
+                print("aborted")
+                return 0
+        _ssh_run(dgx["ssh_user"], dgx["host"],
+                 "pkill -f 'vllm serve' 2>/dev/null; echo done", timeout=10)
+        dgx["vllm_servers"] = []
+        save_dgx_config(dgx)
+        print(f"Stopped all vLLM servers. GPU memory freed.")
+        return 0
+
+    if not model:
+        print("usage: hermes dgx models rm <model>  OR  hermes dgx models rm --all")
+        return 2
+
+    if _is_hf_model(model):
+        entry = next((s for s in servers if s.get("model") == model), None)
+        if not entry:
+            print(f"No tracked vLLM server for {model}.")
+            print(f"Try: hermes dgx run \"pkill -f 'vllm serve {model}'\"")
+            return 1
+        port = entry["port"]
+        if not force:
+            try:
+                ans = input(f"Stop vLLM for {model} (port {port}) and free GPU memory? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans not in ("y", "yes"):
+                print("aborted")
+                return 0
+        _ssh_run(dgx["ssh_user"], dgx["host"],
+                 f"fuser -k {port}/tcp 2>/dev/null; pkill -f 'vllm serve {model}' 2>/dev/null; true",
+                 timeout=10)
+        dgx["vllm_servers"] = [s for s in servers if s.get("model") != model]
+        save_dgx_config(dgx)
+        print(f"Stopped vLLM for {model} (port {port}). GPU memory freed.")
+        return 0
+
+    return _cmd_rm(model=model, force=force)
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +1039,18 @@ def _cmd_setup() -> int:
         print(f"  vLLM 32B http://{host}:{vllm_32b_port}  ✗  (not ready yet — model may still be downloading)")
     print()
 
+    # --- Scan HuggingFace cache ---
+    print("HuggingFace cache (scanning...)", end="", flush=True)
+    hf_models = _list_hf_models(ssh_user, host)
+    if hf_models:
+        shown = [m.split("/")[-1] for m in hf_models[:3]]
+        extra = len(hf_models) - len(shown)
+        summary = ", ".join(shown) + (f" +{extra} more" if extra else "")
+        print(f"\r  HF cache: {len(hf_models)} model(s) — {summary}            ")
+    else:
+        print(f"\r  HF cache: empty — download with: hermes dgx run \"hf download <org/model>\"")
+    print()
+
     # --- Choose default endpoint ---
     available = []
     if ollama_ok:
@@ -858,24 +1085,30 @@ def _cmd_setup() -> int:
     print()
 
     # --- Choose default model ---
-    all_models: List[str] = []
+    endpoint_models: List[str] = []
     if chosen_ep == "ollama":
-        all_models = ollama_models
-    elif chosen_ep == "vllm":
-        all_models = vllm_models
+        endpoint_models = ollama_models
+    elif chosen_ep in ("vllm", "vllm-32b"):
+        endpoint_models = vllm_models
+
+    # Combine endpoint models + HF cached models (labelled)
+    all_choices: List[Tuple[str, str]] = (
+        [(m, "") for m in endpoint_models]
+        + [(m, "  ← HF cache (serve with: hermes dgx models add <id>)") for m in hf_models]
+    )
 
     current_model = current.get("default_model", DEFAULTS["default_model"])
-    if all_models:
+    if all_choices:
         print("Default model")
-        for i, m in enumerate(all_models, 1):
+        for i, (m, note) in enumerate(all_choices, 1):
             marker = " (current)" if m == current_model else ""
-            print(f"  {i}) {m}{marker}")
+            print(f"  {i}) {m}{marker}{note}")
         print(f"  Or type a model name directly.")
         raw = input(f"  Choice [{current_model}]: ").strip()
         if not raw:
             chosen_model = current_model
-        elif raw.isdigit() and 1 <= int(raw) <= len(all_models):
-            chosen_model = all_models[int(raw) - 1]
+        elif raw.isdigit() and 1 <= int(raw) <= len(all_choices):
+            chosen_model = all_choices[int(raw) - 1][0]
         else:
             chosen_model = raw
     else:
