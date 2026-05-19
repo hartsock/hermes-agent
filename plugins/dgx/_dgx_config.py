@@ -49,7 +49,7 @@ ENDPOINT_LABELS = {
 
 # Predefined model formations: name → {model, endpoint}
 DEFAULT_FORMATIONS: Dict[str, Dict[str, str]] = {
-    "coding":      {"model": "qwen3.6:35b-a3b-coding-nvfp4", "endpoint": "ollama"},
+    "coding":      {"model": "qwen3-coder:30b",               "endpoint": "ollama"},
     "reasoning":   {"model": "deepseek-r1:70b",               "endpoint": "ollama"},
     "fast":        {"model": "nemotron-mini:4b",               "endpoint": "ollama"},
     "flagship":    {"model": "qwen3.6:35b",                   "endpoint": "ollama"},
